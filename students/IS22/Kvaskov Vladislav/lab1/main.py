@@ -20,7 +20,6 @@ def get_response(system_prompt: str, user_text: str, client: OpenAI, dialog_hist
     if len(dialog_history) > 6:
         dialog_history.pop(0)
 
-        
     messages = [{"role": "system", "content": system_prompt}] + dialog_history
 
     response = client.responses.create(
