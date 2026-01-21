@@ -54,7 +54,7 @@ CLASSES = [GROUP + 11, VARIANT + 37]
 
 Пример изображения из выборки CIFAR100:
 
-![alt text](./images/1.jpg)
+![alt text](./images/1.JPG)
 
 ## 2. Архитектура CNN
 
@@ -194,7 +194,7 @@ for epoch in range(EPOCHS):  # проход по набору данных не�
 
 ### 2.5 Результат обучения
 
-![alt text](./images/2.jpg)
+![alt text](./images/2.JPG)
 ```
 train
               precision    recall  f1-score   support
@@ -347,7 +347,7 @@ class CNN_AvgPool(nn.Module):
 Результат тестирования
 
 ![alt text](./images/4.jpg)
-![alt text](./images/3.jpg)
+![alt text](./images/3.JPG)
 
 ## Вывод
 
