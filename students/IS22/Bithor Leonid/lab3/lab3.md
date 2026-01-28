@@ -82,7 +82,264 @@ Attu - графический веб-интерфейс для визуальн�
 
 _Рисунок 6 ,7: Универсальный инструмент администрирования Milvus - ATTU_
 
+## Организация проекта
+Добавляем все файлы, которые были реализованы ранее (кроме example_usage.py) в папку core, чтобы спокойно их импортировать, когда они будут нам нужны.
+
+Теперь создаём файл services.py, который отвечает за инициализацию основных компонентов системы. Создаём milvus_client, который является экземпляром клиента Milvus. Он нужен для подключения к базе данных и выполнению операций с коллекциями, вставки и поиска векторов. Далее создаём embedder, который нужен для генерации embeddings текстов и запросов. Затем создаём функцию embedding_fn для использования обработчика документов и добавляем document_processor, который объединяет возможности парсинга текстов, генерации embeddings и загрузки чанков в Milvus.
+
+```python
+from core.milvus_client import MilvusClient
+from core.embedder import Embedder, create_embedding_function
+from core.document_processor import DocumentProcessor
+
+milvus_client = MilvusClient(host="standalone", port=19530)
+
+embedder = Embedder(device="cuda")
+
+embedding_fn = create_embedding_function(
+    model_name="intfloat/multilingual-e5-base",
+    batch_size=32
+)
+
+document_processor = DocumentProcessor(
+    milvus_client=milvus_client,
+    chunk_size=256,
+    chunk_overlap=64,
+    embedding_function=embedding_fn
+)
+```
+Создаём файл serializers.py, который отвечает за валидацию и структурирование данных, поступающих через API. Так как в сценарии были создание коллекций, загрузку документов и семантический поиск, реализуем это с помощью сериализаторов CreateCollectionSerializer, UploadDocumentsSerializer и SearchSerializer.
+
+CreateCollectionSerializer мы создаём для проверки данных, перед созданием коллекции в Milvus. Также как и в сценарии, добавляем force_delete для удаления существующей коллекции перед созданием новой.
+
+```python
+from rest_framework import serializers
+
+class CreateCollectionSerializer(serializers.Serializer):
+    name = serializers.CharField()
+    dimension = serializers.IntegerField(default=768)
+    metric_type = serializers.ChoiceField(
+        choices=["COSINE", "L2", "IP"],
+        default="COSINE"
+    )
+    force_delete = serializers.BooleanField(
+        default=False)
+```
+UploadDocumentsSerializer создаём для загрузки документов в коллекцию. Как и в сценарии, проверяем указана ли директория с файлами или текст для загрузки, и передаём эти данные обработчику документов для чанкирования и генерации embeddings.
+
+```python
+class UploadDocumentsSerializer(serializers.Serializer):
+    collection_name = serializers.CharField()
+    directory = serializers.CharField(required=False)
+    text = serializers.CharField(required=False)
+```
+SearchSerializer используется для семантического поиска. Он валидирует коллекцию для поиска, текст запроса и количество ближайших результатов.
+
+```python
+class SearchSerializer(serializers.Serializer):
+    collection_name = serializers.CharField()
+    query = serializers.CharField()
+    top_k = serializers.IntegerField(default=3)
+```
+В файл views.py реализуем обработчики API-запросов, которые обеспечивают взаимодействие пользователя с системой через HTTP-запросы. Для этого были добавлены следующие классы: CreateCollectionView, UploadDocumentsView, SemanticSearchView, DocumentChunksView, CollectionInfoView.
+
+CreateCollectionView создаёт коллекции в Milvus через POST-запрос. В нём мы используем ранее созданный CreateCollectionSerializer для валидации входных данных.
+```python
+from rest_framework.views import APIView
+from rest_framework.response import Response
+from rest_framework import status
+from .serializers import CreateCollectionSerializer
+from .services import milvus_client
+
+class CreateCollectionView(APIView):
+    """Создание коллекции в Milvus"""
+
+    def post(self, request):
+        serializer = CreateCollectionSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        if data.get("force_delete"):
+            milvus_client.delete_collection(data["name"])
+
+        collection = milvus_client.create_collection(
+            collection_name=data["name"],
+            dimension=data["dimension"],
+            metric_type=data["metric_type"]
+        )
+
+        return Response(
+            {"message": f"Коллекция '{collection.name}' создана"},
+            status=status.HTTP_201_CREATED
+        )
+```
+UploadDocumentsView обрабатывает POST-запросы для загрузки документов или текста в коллекцию, используя ранее созданный UploadDocumentsSerializer. Также здесь вызывается DocumentProcessor для чанкирования текста и генерации embeddings, после чего данные вставляются в коллекцию Milvus.
+
+```python
+from .serializers import UploadDocumentsSerializer
+from .services import document_processor
+import os
+
+class UploadDocumentsView(APIView):
+    """Загрузка файлов или текста в Milvus"""
+
+    def post(self, request):
+        serializer = UploadDocumentsSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        collection_name = data["collection_name"]
+        directory = data.get("directory")
+
+        if directory and os.path.exists(directory):
+            txt_files = [
+                f for f in os.listdir(directory)
+                if f.endswith(".txt")
+            ]
+
+            results = []
+
+            for txt_file in txt_files:
+                file_path = os.path.join(directory, txt_file)
+
+                result = document_processor.process_file(
+                    file_path=file_path,
+                    collection_name=collection_name
+                )
+
+                results.append({
+                    "file": txt_file,
+                    "success": result["success"],
+                    "chunks_count": result.get("chunks_count", 0),
+                    "error": result.get("error")
+                })
+
+            return Response({
+                "directory": directory,
+                "files_found": len(txt_files),
+                "results": results
+            })
+
+        sample_text = data.get("text")
+        if sample_text:
+            result = document_processor.process_text(
+                text=sample_text,
+                collection_name=collection_name
+            )
+            return Response(result)
+
+        return Response(
+            {
+                "error": "Директория не найдена и текст не передан"
+            },
+            status=status.HTTP_400_BAD_REQUEST
+        )
+```
+В SemanticSearchView выполняются POST-запросы для семантического поиска по коллекции. Для этого используется также ранее созданный SearchSerializer. Генерирует embedding запроса с помощью embedder и вызывает метод поиска в Milvus.
+
+```python
+from .serializers import SearchSerializer
+from .services import embedder, milvus_client
+
+class SemanticSearchView(APIView):
+    """Семантический поиск в Milvus"""
+
+    def post(self, request):
+        serializer = SearchSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        query_vector = embedder.encode_query(data["query"])
+
+        results = milvus_client.search(
+            collection_name=data["collection_name"],
+            query_vectors=[query_vector],
+            top_k=data["top_k"]
+        )
+
+        return Response(results[0])
+```
+DocumentChunksView позволяет через GET запрос получить все чанки конкретного документа по его пути.
+
+```python
+class DocumentChunksView(APIView):
+    """Получение всех чанков документа по пути"""
+
+    def get(self, request, collection_name, file_path):
+        try:
+            chunks = milvus_client.get_document_chunks(
+                collection_name, file_path)
+            return Response(chunks)
+        except Exception as e:
+            return Response({"error": str(e)}, status=400)
+```
+CollectionInfoView позволяет через GET запрос вернуть информацию о коллекции: сколько записей, существование коллекции и другие метаданные. Так как данные из Milvus содержат сложные объекты, которые не могут быть автоматически преобразованы в JSON, создаём словари с простыми типами: строками, числами, списками и вложенными словарями. После преобразования всех компонентов в читаемый формат, данные возвращаются как JSON.
+
+```python
+class CollectionInfoView(APIView):
+    """Информация о коллекции Milvus"""
+
+    def get(self, request, name):
+        try:
+            info = milvus_client.get_collection_info(name)
+
+            if not info['exists']:
+                return Response({"error": f"Коллекция '{name}' не найдена"}, status=404)
+
+            schema = info.get('schema')
+            if schema:
+                fields = []
+                for field in getattr(schema, "fields", []):
+                    fields.append({
+                        "name": field.name,
+                        "dtype": str(field.dtype),
+                        "is_primary": getattr(field, "is_primary", False),
+                        "auto_id": getattr(field, "auto_id", False),
+                        "max_length": getattr(field, "max_length", None),
+                        "description": getattr(field, "description", "")
+                    })
+                info['schema'] = {
+                    "description": getattr(schema, "description", ""),
+                    "fields": fields
+                }
+
+            indexes = info.get('indexes', [])
+            serializable_indexes = []
+            for index in indexes:
+                serializable_indexes.append({
+                    "field_name": getattr(index, "field_name", ""),
+                    "index_type": getattr(index, "index_type", ""),
+                    "params": getattr(index, "params", {})
+                })
+            info['indexes'] = serializable_indexes
+
+            return Response(info)
+
+        except Exception as e:
+            return Response({"error": str(e)}, status=400)
+```
+Теперь в файле urls.py пропишем маршруты, которые HTTP-запросы пользователя с нужными API запросами. Добавляем путь collections/create/ для создания новой коллекции в Milvus, collections/<str:name>/info/ для получения информации о коллекции, documents/upload/ для загрузки текстовых файлов или произвольного текста в Milvus, documents/<str:collection_name>/chunks/<path:file_path>/ для получения всех чанков конкретного документа по его пути и добавляем search/ для выполнения семантического поиска по коллекции.
+
+```python
+from django.urls import path
+from .views import (
+    CreateCollectionView,
+    UploadDocumentsView,
+    SemanticSearchView,
+    CollectionInfoView,
+    DocumentChunksView
+)
+
+urlpatterns = [
+    path("collections/create/", CreateCollectionView.as_view()),
+    path("collections/<str:name>/info/", CollectionInfoView.as_view()),
+    path("documents/upload/", UploadDocumentsView.as_view()),
+    path("documents/<str:collection_name>/chunks/<path:file_path>/",
+         DocumentChunksView.as_view()),
+    path("search/", SemanticSearchView.as_view()),
+]
+```
 
 ### Вывод
 
-В процессе выполнения лабораторной работы удалось ознакомится с взаимодействем с векторной базой данных milvus. Так же был получен практический опыт настройки docker-контейнера на использованите мощностей видеокарты, путем конфигурации docker-compose файла. Через интерфейс Attu успешно проведён поиск по коллекциям, что подтвердило работоспособность системы. Для взаимодействия с системой частично реализован REST API (архитектурный стиль, который используется для взаимодействия между клиентом и сервером через протокол HTTP).
+В процессе выполнения лабораторной работы удалось ознакомиться с взаимодействием с векторной базой данных Milvus. Так же был получен практический опыт настройки docker-контейнера на использованите мощностей видеокарты, путем конфигурации docker-compose файла. Через интерфейс Attu успешно проведён поиск по коллекциям, что подтвердило работоспособность системы. Для взаимодействия с системой частично реализован REST API (архитектурный стиль, который используется для взаимодействия между клиентом и сервером через протокол HTTP).
